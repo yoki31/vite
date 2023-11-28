@@ -1,186 +1,139 @@
-import fs from 'fs'
-import path from 'path'
-import { tryNodeResolve, InternalResolveOptions } from '../plugins/resolve'
+import path from 'node:path'
+import type { InternalResolveOptions } from '../plugins/resolve'
+import { tryNodeResolve } from '../plugins/resolve'
 import {
+  bareImportRE,
   createDebugger,
-  isDefined,
-  lookupFile,
-  normalizePath,
-  resolveFrom
+  createFilter,
+  getNpmPackageName,
+  isBuiltin,
 } from '../utils'
-import { ResolvedConfig } from '..'
-import { createFilter } from '@rollup/pluginutils'
+import type { ResolvedConfig } from '..'
 
 const debug = createDebugger('vite:ssr-external')
 
-/**
- * Heuristics for determining whether a dependency should be externalized for
- * server-side rendering.
- */
-export function resolveSSRExternal(
-  config: ResolvedConfig,
-  knownImports: string[]
-): string[] {
-  const ssrConfig = config.ssr
-  if (ssrConfig?.noExternal === true) {
-    return []
-  }
-
-  const ssrExternals: Set<string> = new Set()
-  const seen: Set<string> = new Set()
-  ssrConfig?.external?.forEach((id) => {
-    ssrExternals.add(id)
-    seen.add(id)
-  })
-
-  collectExternals(
-    config.root,
-    config.resolve.preserveSymlinks,
-    ssrExternals,
-    seen
-  )
-
-  const importedDeps = knownImports.map(getNpmPackageName).filter(isDefined)
-  for (const dep of importedDeps) {
-    // Assume external if not yet seen
-    // At this point, the project root and any linked packages have had their dependencies checked,
-    // so we can safely mark any knownImports not yet seen as external. They are guaranteed to be
-    // dependencies of packages in node_modules.
-    if (!seen.has(dep)) {
-      ssrExternals.add(dep)
-    }
-  }
-
-  // ensure `vite/dynamic-import-polyfill` is bundled (issue #1865)
-  ssrExternals.delete('vite')
-
-  let externals = [...ssrExternals]
-  if (ssrConfig?.noExternal) {
-    externals = externals.filter(
-      createFilter(undefined, ssrConfig.noExternal, { resolve: false })
-    )
-  }
-  return externals
-}
-
-// do we need to do this ahead of time or could we do it lazily?
-function collectExternals(
-  root: string,
-  preserveSymlinks: boolean | undefined,
-  ssrExternals: Set<string>,
-  seen: Set<string>
-) {
-  const pkgContent = lookupFile(root, ['package.json'])
-  if (!pkgContent) {
-    return
-  }
-
-  const pkg = JSON.parse(pkgContent)
-  const deps = {
-    ...pkg.devDependencies,
-    ...pkg.dependencies
-  }
-
-  const resolveOptions: InternalResolveOptions = {
-    root,
-    preserveSymlinks,
-    isProduction: false,
-    isBuild: true
-  }
-
-  const depsToTrace = new Set<string>()
-
-  for (const id in deps) {
-    if (seen.has(id)) continue
-    seen.add(id)
-
-    let esmEntry: string | undefined
-    let requireEntry: string
-    try {
-      esmEntry = tryNodeResolve(
-        id,
-        undefined,
-        resolveOptions,
-        true, // we set `targetWeb` to `true` to get the ESM entry
-        undefined,
-        true
-      )?.id
-      // normalizePath required for windows. tryNodeResolve uses normalizePath
-      // which returns with '/', require.resolve returns with '\\'
-      requireEntry = normalizePath(require.resolve(id, { paths: [root] }))
-    } catch (e) {
-      try {
-        // no main entry, but deep imports may be allowed
-        const pkgPath = resolveFrom(`${id}/package.json`, root)
-        if (pkgPath.includes('node_modules')) {
-          ssrExternals.add(id)
-        } else {
-          depsToTrace.add(path.dirname(pkgPath))
-        }
-        continue
-      } catch {}
-
-      // resolve failed, assume include
-      debug(`Failed to resolve entries for package "${id}"\n`, e)
-      continue
-    }
-    // no esm entry but has require entry
-    if (!esmEntry) {
-      ssrExternals.add(id)
-    }
-    // trace the dependencies of linked packages
-    else if (!esmEntry.includes('node_modules')) {
-      const pkgPath = resolveFrom(`${id}/package.json`, root)
-      depsToTrace.add(path.dirname(pkgPath))
-    }
-    // has separate esm/require entry, assume require entry is cjs
-    else if (esmEntry !== requireEntry) {
-      ssrExternals.add(id)
-    }
-    // if we're externalizing ESM and CJS should basically just always do it?
-    // or are there others like SystemJS / AMD that we'd need to handle?
-    // for now, we'll just leave this as is
-    else if (/\.m?js$/.test(esmEntry)) {
-      if (pkg.type === 'module' || esmEntry.endsWith('.mjs')) {
-        ssrExternals.add(id)
-        continue
-      }
-      // check if the entry is cjs
-      const content = fs.readFileSync(esmEntry, 'utf-8')
-      if (/\bmodule\.exports\b|\bexports[.\[]|\brequire\s*\(/.test(content)) {
-        ssrExternals.add(id)
-      }
-    }
-  }
-
-  for (const depRoot of depsToTrace) {
-    collectExternals(depRoot, preserveSymlinks, ssrExternals, seen)
-  }
-}
+const isSsrExternalCache = new WeakMap<
+  ResolvedConfig,
+  (id: string, importer?: string) => boolean | undefined
+>()
 
 export function shouldExternalizeForSSR(
   id: string,
-  externals: string[]
-): boolean {
-  const should = externals.some((e) => {
-    if (id === e) {
-      return true
-    }
-    // deep imports, check ext before externalizing - only externalize
-    // extension-less imports and explicit .js imports
-    if (id.startsWith(e + '/') && (!path.extname(id) || id.endsWith('.js'))) {
-      return true
-    }
-  })
-  return should
+  importer: string | undefined,
+  config: ResolvedConfig,
+): boolean | undefined {
+  let isSsrExternal = isSsrExternalCache.get(config)
+  if (!isSsrExternal) {
+    isSsrExternal = createIsSsrExternal(config)
+    isSsrExternalCache.set(config, isSsrExternal)
+  }
+  return isSsrExternal(id, importer)
 }
 
-function getNpmPackageName(importPath: string): string | null {
-  const parts = importPath.split('/')
-  if (parts[0].startsWith('@')) {
-    if (!parts[1]) return null
-    return `${parts[0]}/${parts[1]}`
-  } else {
-    return parts[0]
+export function createIsConfiguredAsSsrExternal(
+  config: ResolvedConfig,
+): (id: string, importer?: string) => boolean {
+  const { ssr, root } = config
+  const noExternal = ssr?.noExternal
+  const noExternalFilter =
+    noExternal !== 'undefined' &&
+    typeof noExternal !== 'boolean' &&
+    createFilter(undefined, noExternal, { resolve: false })
+
+  const targetConditions = config.ssr.resolve?.externalConditions || []
+
+  const resolveOptions: InternalResolveOptions = {
+    ...config.resolve,
+    root,
+    isProduction: false,
+    isBuild: true,
+    conditions: targetConditions,
+  }
+
+  const isExternalizable = (
+    id: string,
+    importer?: string,
+    configuredAsExternal?: boolean,
+  ): boolean => {
+    if (!bareImportRE.test(id) || id.includes('\0')) {
+      return false
+    }
+    try {
+      return !!tryNodeResolve(
+        id,
+        // Skip passing importer in build to avoid externalizing non-hoisted dependencies
+        // unresolvable from root (which would be unresolvable from output bundles also)
+        config.command === 'build' ? undefined : importer,
+        resolveOptions,
+        ssr?.target === 'webworker',
+        undefined,
+        true,
+        // try to externalize, will return undefined or an object without
+        // a external flag if it isn't externalizable
+        true,
+        // Allow linked packages to be externalized if they are explicitly
+        // configured as external
+        !!configuredAsExternal,
+      )?.external
+    } catch (e) {
+      debug?.(
+        `Failed to node resolve "${id}". Skipping externalizing it by default.`,
+      )
+      // may be an invalid import that's resolved by a plugin
+      return false
+    }
+  }
+
+  // Returns true if it is configured as external, false if it is filtered
+  // by noExternal and undefined if it isn't affected by the explicit config
+  return (id: string, importer?: string) => {
+    const { ssr } = config
+    if (ssr) {
+      if (
+        // If this id is defined as external, force it as external
+        // Note that individual package entries are allowed in ssr.external
+        ssr.external?.includes(id)
+      ) {
+        return true
+      }
+      const pkgName = getNpmPackageName(id)
+      if (!pkgName) {
+        return isExternalizable(id, importer)
+      }
+      if (
+        // A package name in ssr.external externalizes every
+        // externalizable package entry
+        ssr.external?.includes(pkgName)
+      ) {
+        return isExternalizable(id, importer, true)
+      }
+      if (typeof noExternal === 'boolean') {
+        return !noExternal
+      }
+      if (noExternalFilter && !noExternalFilter(pkgName)) {
+        return false
+      }
+    }
+    return isExternalizable(id, importer)
+  }
+}
+
+function createIsSsrExternal(
+  config: ResolvedConfig,
+): (id: string, importer?: string) => boolean | undefined {
+  const processedIds = new Map<string, boolean | undefined>()
+
+  const isConfiguredAsExternal = createIsConfiguredAsSsrExternal(config)
+
+  return (id: string, importer?: string) => {
+    if (processedIds.has(id)) {
+      return processedIds.get(id)
+    }
+    let external = false
+    if (id[0] !== '.' && !path.isAbsolute(id)) {
+      external = isBuiltin(id) || isConfiguredAsExternal(id, importer)
+    }
+    processedIds.set(id, external)
+    return external
   }
 }

@@ -1,10 +1,16 @@
-import path from 'path'
-import { OutputChunk } from 'rollup'
-import { ResolvedConfig } from '..'
-import { Plugin } from '../plugin'
-import { chunkToEmittedCssFileMap } from './css'
-import { chunkToEmittedAssetsMap } from './asset'
+import path from 'node:path'
+import type {
+  InternalModuleFormat,
+  OutputAsset,
+  OutputChunk,
+  RenderedChunk,
+} from 'rollup'
+import jsonStableStringify from 'json-stable-stringify'
+import type { ResolvedConfig } from '..'
+import type { Plugin } from '../plugin'
 import { normalizePath } from '../utils'
+import { generatedAssets } from './asset'
+import type { GeneratedAssetMeta } from './asset'
 
 export type Manifest = Record<string, ManifestChunk>
 
@@ -33,18 +39,7 @@ export function manifestPlugin(config: ResolvedConfig): Plugin {
 
     generateBundle({ format }, bundle) {
       function getChunkName(chunk: OutputChunk) {
-        if (chunk.facadeModuleId) {
-          let name = normalizePath(
-            path.relative(config.root, chunk.facadeModuleId)
-          )
-          if (format === 'system' && !chunk.name.includes('-legacy')) {
-            const ext = path.extname(name)
-            name = name.slice(0, -ext.length) + `-legacy` + ext
-          }
-          return name
-        } else {
-          return `_` + path.basename(chunk.fileName)
-        }
+        return getChunkOriginalFileName(chunk, config.root, format)
       }
 
       function getInternalImports(imports: string[]): string[] {
@@ -63,7 +58,7 @@ export function manifestPlugin(config: ResolvedConfig): Plugin {
 
       function createChunk(chunk: OutputChunk): ManifestChunk {
         const manifestChunk: ManifestChunk = {
-          file: chunk.fileName
+          file: chunk.fileName,
         }
 
         if (chunk.facadeModuleId) {
@@ -90,34 +85,104 @@ export function manifestPlugin(config: ResolvedConfig): Plugin {
           }
         }
 
-        const cssFiles = chunkToEmittedCssFileMap.get(chunk)
-        if (cssFiles) {
-          manifestChunk.css = [...cssFiles]
+        if (chunk.viteMetadata?.importedCss.size) {
+          manifestChunk.css = [...chunk.viteMetadata.importedCss]
         }
-
-        const assets = chunkToEmittedAssetsMap.get(chunk)
-        if (assets) [(manifestChunk.assets = [...assets])]
+        if (chunk.viteMetadata?.importedAssets.size) {
+          manifestChunk.assets = [...chunk.viteMetadata.importedAssets]
+        }
 
         return manifestChunk
       }
+
+      function createAsset(
+        asset: OutputAsset,
+        src: string,
+        isEntry?: boolean,
+      ): ManifestChunk {
+        const manifestChunk: ManifestChunk = {
+          file: asset.fileName,
+          src,
+        }
+        if (isEntry) manifestChunk.isEntry = true
+        return manifestChunk
+      }
+
+      const fileNameToAssetMeta = new Map<string, GeneratedAssetMeta>()
+      const assets = generatedAssets.get(config)!
+      assets.forEach((asset, referenceId) => {
+        try {
+          const fileName = this.getFileName(referenceId)
+          fileNameToAssetMeta.set(fileName, asset)
+        } catch (error: unknown) {
+          // The asset was generated as part of a different output option.
+          // It was already handled during the previous run of this plugin.
+          assets.delete(referenceId)
+        }
+      })
+
+      const fileNameToAsset = new Map<string, ManifestChunk>()
 
       for (const file in bundle) {
         const chunk = bundle[file]
         if (chunk.type === 'chunk') {
           manifest[getChunkName(chunk)] = createChunk(chunk)
+        } else if (chunk.type === 'asset' && typeof chunk.name === 'string') {
+          // Add every unique asset to the manifest, keyed by its original name
+          const assetMeta = fileNameToAssetMeta.get(chunk.fileName)
+          const src = assetMeta?.originalName ?? chunk.name
+          const asset = createAsset(chunk, src, assetMeta?.isEntry)
+
+          // If JS chunk and asset chunk are both generated from the same source file,
+          // prioritize JS chunk as it contains more information
+          if (manifest[src]?.file.endsWith('.js')) continue
+          manifest[src] = asset
+          fileNameToAsset.set(chunk.fileName, asset)
         }
       }
+
+      // Add deduplicated assets to the manifest
+      assets.forEach(({ originalName }, referenceId) => {
+        if (!manifest[originalName]) {
+          const fileName = this.getFileName(referenceId)
+          const asset = fileNameToAsset.get(fileName)
+          if (asset) {
+            manifest[originalName] = asset
+          }
+        }
+      })
 
       outputCount++
       const output = config.build.rollupOptions?.output
       const outputLength = Array.isArray(output) ? output.length : 1
       if (outputCount >= outputLength) {
         this.emitFile({
-          fileName: `manifest.json`,
+          fileName:
+            typeof config.build.manifest === 'string'
+              ? config.build.manifest
+              : '.vite/manifest.json',
           type: 'asset',
-          source: JSON.stringify(manifest, null, 2)
+          source: jsonStableStringify(manifest, { space: 2 }),
         })
       }
+    },
+  }
+}
+
+export function getChunkOriginalFileName(
+  chunk: OutputChunk | RenderedChunk,
+  root: string,
+  format: InternalModuleFormat,
+): string {
+  if (chunk.facadeModuleId) {
+    let name = normalizePath(path.relative(root, chunk.facadeModuleId))
+    if (format === 'system' && !chunk.name.includes('-legacy')) {
+      const ext = path.extname(name)
+      const endPos = ext.length !== 0 ? -ext.length : undefined
+      name = name.slice(0, endPos) + `-legacy` + ext
     }
+    return name.replace(/\0/g, '')
+  } else {
+    return `_` + path.basename(chunk.fileName)
   }
 }
